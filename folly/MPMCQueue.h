@@ -1201,7 +1201,7 @@ class MPMCQueueBase<Derived<T, Atom, Dynamic, Allocator>> {
       // if we wake up before we time-out.
       deadlineReached =
           !slots[idx(ticket, cap, stride)].tryWaitForEnqueueTurnUntil(
-              turn(ticket, cap),
+turn(ticket, cap),
               pushSpinCutoff_,
               (ticket % kAdaptationFreq) == 0,
               when);
@@ -1554,3 +1554,112 @@ struct SingleElementQueue {
 } // namespace detail
 
 } // namespace folly
+
+/**
+ * @brief 高性能的有界并发队列，支持多生产者、多消费者和可选的阻塞操作
+ * 
+ * MPMCQueue<T> 是一个固定容量的并发队列实现，所有内存会预先分配。入队和出队的大部分工作可以并行执行。
+ * 该实现是线性化的，具有出色的性能特性，尤其在高并发场景下表现优异。
+ * 
+ * @tparam T 队列中存储的元素类型
+ * @tparam Atom 原子操作模板，默认为std::atomic
+ * @tparam Dynamic 是否为动态容量版本，默认为false
+ * @tparam Allocator 内存分配器类型，默认为std::allocator<T>
+ */
+template <
+    typename T,
+    template <typename> class Atom = std::atomic,
+    bool Dynamic = false,
+    class Allocator = std::allocator<T>>
+class MPMCQueue
+    : public detail::MPMCQueueBase<MPMCQueue<T, Atom, Dynamic, Allocator>>,
+      std::allocator_traits<Allocator>::template rebind_alloc<
+          detail::SingleElementQueue<T, Atom>> {
+  // 友元类声明
+  friend class detail::MPMCPipelineStageImpl<T>;
+  
+  // 类型别名定义
+  using Base = detail::MPMCQueueBase<MPMCQueue<T, Atom, Dynamic, Allocator>>;
+  using Slot = detail::SingleElementQueue<T, Atom>;  // 单元素队列类型
+  using SlotAllocator = 
+      typename std::allocator_traits<Allocator>::template rebind_alloc<Slot>;
+  using SlotAllocatorTraits = std::allocator_traits<SlotAllocator>;
+
+ public:
+  using typename Base::value_type;
+
+  /**
+   * @brief 构造指定容量的队列
+   * @param queueCapacity 队列容量
+   */
+  explicit MPMCQueue(size_t queueCapacity) : Base(queueCapacity) {
+    initQueue(queueCapacity);
+  }
+
+  /**
+   * @brief 构造指定容量的队列，并使用自定义分配器
+   * @param queueCapacity 队列容量
+   * @param alloc 自定义分配器实例
+   */
+  MPMCQueue(size_t queueCapacity, const SlotAllocator& alloc)
+      : Base(queueCapacity), SlotAllocator(alloc) {
+    initQueue(queueCapacity);
+  }
+
+  // 默认构造函数和移动构造函数
+  MPMCQueue() noexcept = default;
+  MPMCQueue(MPMCQueue&&) noexcept = default;
+  
+  /**
+   * @brief 移动赋值操作符
+   * @note 仅在初始化阶段使用，当有并发访问时使用是不安全的（不检查此条件）
+   */
+  MPMCQueue const& operator=(MPMCQueue&& rhs) {
+    if (this != &rhs) {
+      this->~MPMCQueue();
+      new (this) MPMCQueue(std::move(rhs));
+    }
+    return *this;
+  }
+  
+  /**
+   * @brief 析构函数，释放队列资源
+   */
+  ~MPMCQueue() {
+    if (kUsingStdAllocator) {
+      delete[] this->slots_;
+      this->slots_ = nullptr;
+    } else {
+      if (this->slots_) {
+        size_t count = this->capacity_ + 2 * this->kSlotPadding;
+        for (size_t i = 0; i < count; ++i) {
+          SlotAllocatorTraits::destroy(*this, this->slots_ + i);
+        }
+        SlotAllocatorTraits::deallocate(*this, this->slots_, count);
+        this->slots_ = nullptr;
+      }
+    }
+  }
+
+ private:
+  // 判断是否使用标准分配器
+  static constexpr bool kUsingStdAllocator = 
+      is_instantiation_of_v<std::allocator, Allocator>;
+
+  /**
+   * @brief 初始化队列
+   * @param queueCapacity 队列容量
+   */
+  void initQueue(size_t queueCapacity) {
+    this->stride_ = this->computeStride(queueCapacity);
+    size_t count = queueCapacity + 2 * this->kSlotPadding;
+    if (kUsingStdAllocator) {
+      this->slots_ = new Slot[count];
+    } else {
+      this->slots_ = SlotAllocatorTraits::allocate(*this, count);
+      for (size_t i = 0; i < count; ++i) {
+        SlotAllocatorTraits::construct(*this, this->slots_ + i);
+      }
+    }
+  }
+};
